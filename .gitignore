@@ -2,12 +2,17 @@
 info/
 
 # Data and generated artifacts
-data/
-experiments/
-tmp/
+data/*
+!data/README.md
+experiments/*
+!experiments/README.md
+tmp/*
+!tmp/README.md
 .autodl/
-lstm_kmean/data/
-lstm_kmean/experiments/
+lstm_kmean/data/*
+!lstm_kmean/data/README.md
+lstm_kmean/experiments/*
+!lstm_kmean/experiments/README.md
 
 # Python cache
 __pycache__/
