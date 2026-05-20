@@ -1,0 +1,22 @@
+# Local notes
+info/
+
+# Data and generated artifacts
+data/
+experiments/
+results/
+tmp/
+anaconda/
+.autodl/
+lstm_kmean/data/
+lstm_kmean/experiments/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Notebook cache
+.ipynb_checkpoints/
+**/.ipynb_checkpoints/
