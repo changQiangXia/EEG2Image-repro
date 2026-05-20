@@ -4,9 +4,7 @@ info/
 # Data and generated artifacts
 data/
 experiments/
-results/
 tmp/
-anaconda/
 .autodl/
 lstm_kmean/data/
 lstm_kmean/experiments/
