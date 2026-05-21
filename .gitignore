@@ -1,5 +1,20 @@
 # Local notes
 info/
+EEG2Image-ablation-report.md
+results/
+
+# Legacy and non-ablation scripts
+benchmark.py
+inceptionscore.py
+inference.py
+not_use_dummy_inference_inception.py
+not_use_dummy_inference_inceptionscore.py
+save_figure.py
+test_generation.py
+thoughtvis_inceptionscore.py
+train.py
+tmp/eval_utils.py
+tmp/thoughtvis_inceptionscore.py
 
 # Data and generated artifacts
 data/*
