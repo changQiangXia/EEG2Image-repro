@@ -1,6 +1,6 @@
 # EEG2Image 消融复现项目
 
-本仓库面向 EEG2Image 的消融复现。
+本仓库进行 EEG2Image 的消融研究。
 
 当前版本聚焦于 Object subset 上的四组 GAN loss 消融，并对训练、生成、评估流程做了工程化整理。
 
@@ -14,12 +14,6 @@
 - 固定 Inception Score 评估
 - 顺序自动化执行
 
-基础方法来自 EEG2Image：
-
-- 论文：<https://arxiv.org/abs/2302.10121>
-- 原始仓库：<https://github.com/prajwalsingh/EEG2Image>
-
-本仓库聚焦复现、消融和工程整理。
 
 ## 消融设置
 
@@ -184,18 +178,16 @@ CUDA_VISIBLE_DEVICES=0 python train_gan.py \
 └── losses.py
 ```
 
-## 说明
+## 附录
 
-- 大体积数据、权重与实验输出保留在版本控制之外
-- 仓库保留目录骨架和路径说明，方便复现
-- 当前版本围绕消融主线收紧了仓库表面
+相关资源链接：
 
-## 致谢
+- EEG2Image best checkpoint：
+  <https://iitgnacin-my.sharepoint.com/:u:/g/personal/19210048_iitgn_ac_in/EWC0lT5vEN1c206cJ0tdmdQBkVhvCL5TVnNhBI7cWSTKFg?e=jrpnh9>
+- Inception Score 评估资源：
+  <https://iitgnacin-my.sharepoint.com/:u:/g/personal/19210048_iitgn_ac_in/EfWLlhNk0CxXqgMnsKgt8k8BxSqflp98ACpl9ZLScWSHtA?e=cEfq0R>
+- 预处理后的 ThoughtViz EEG 数据：
+  <https://iitgnacin-my.sharepoint.com/:u:/g/personal/19210048_iitgn_ac_in/Ea4Sp2UH__ZbRQGZXu9o-6cByJK4E6E4GtxrcVony9_Q8g?e=bVdyIJ>
+- 后续工作 EEGStyleGAN-ADA：
+  <https://github.com/prajwalsingh/EEGStyleGAN-ADA>
 
-本仓库建立在 EEG2Image 原始方法和原始代码基础之上。
-
-原始方法、论文和外部资源链接来自原作者项目页面。
-
-## 许可证
-
-本仓库保留上游 MIT 许可证，见 [LICENSE](/root/autodl-tmp/LICENSE:1)。
