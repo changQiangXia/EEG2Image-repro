@@ -11,7 +11,7 @@ from natsort import natsorted
 from tqdm import tqdm
 
 from lstm_kmean.model import TripleNet
-from model import DCGAN
+from model import build_gan
 from runtime_utils import configure_runtime, ensure_dir, write_json
 from utils import load_complete_data
 
@@ -26,6 +26,7 @@ def parse_args():
     parser.add_argument("--triplet_ckpt_path", default="")
     parser.add_argument("--gan_ckpt_dir", default="experiments/best_ckpt")
     parser.add_argument("--gan_ckpt_path", default="")
+    parser.add_argument("--gan_variant", choices=["simple_gan", "dcgan"], default="dcgan")
     parser.add_argument("--reference_split", default="test")
     parser.add_argument("--test_image_count", type=int, default=50000)
     parser.add_argument("--dataset_batch_size", type=int, default=64)
@@ -174,7 +175,7 @@ def main():
         target_counts=target_counts,
     )
 
-    model = DCGAN()
+    model = build_gan(args.gan_variant)
     model_gopt = tf.keras.optimizers.Adam(learning_rate=3e-4, beta_1=0.2, beta_2=0.5)
     model_copt = tf.keras.optimizers.Adam(learning_rate=3e-4, beta_1=0.2, beta_2=0.5)
     gan_ckpt = tf.train.Checkpoint(step=tf.Variable(1), model=model, gopt=model_gopt, copt=model_copt)
@@ -196,6 +197,7 @@ def main():
             "triplet_ckpt_path": triplet_path,
             "gan_ckpt_dir": os.path.abspath(args.gan_ckpt_dir),
             "gan_ckpt_path": gan_path,
+            "gan_variant": args.gan_variant,
             "reference_split": args.reference_split,
             "latent_dim": args.latent_dim,
             "test_image_count": args.test_image_count,

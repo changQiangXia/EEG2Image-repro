@@ -59,6 +59,84 @@ class Generator(Model):
 		return X
 
 
+class SimpleGenerator(Model):
+	def __init__(self):
+		super(SimpleGenerator, self).__init__()
+		self.proj = layers.Dense(
+			units=8 * 8 * 256,
+			kernel_initializer=tf.keras.initializers.TruncatedNormal(mean=0.0, stddev=0.02),
+			use_bias=False,
+		)
+		self.reshape = layers.Reshape(target_shape=(8, 8, 256))
+		self.blocks = [
+			(
+				layers.Conv2DTranspose(
+					filters=128,
+					kernel_size=4,
+					strides=2,
+					padding="same",
+					kernel_initializer=tf.keras.initializers.TruncatedNormal(mean=0.0, stddev=0.02),
+					use_bias=False,
+				),
+				layers.BatchNormalization(),
+				layers.ReLU(),
+			),
+			(
+				layers.Conv2DTranspose(
+					filters=64,
+					kernel_size=4,
+					strides=2,
+					padding="same",
+					kernel_initializer=tf.keras.initializers.TruncatedNormal(mean=0.0, stddev=0.02),
+					use_bias=False,
+				),
+				layers.BatchNormalization(),
+				layers.ReLU(),
+			),
+			(
+				layers.Conv2DTranspose(
+					filters=32,
+					kernel_size=4,
+					strides=2,
+					padding="same",
+					kernel_initializer=tf.keras.initializers.TruncatedNormal(mean=0.0, stddev=0.02),
+					use_bias=False,
+				),
+				layers.BatchNormalization(),
+				layers.ReLU(),
+			),
+			(
+				layers.Conv2DTranspose(
+					filters=16,
+					kernel_size=4,
+					strides=2,
+					padding="same",
+					kernel_initializer=tf.keras.initializers.TruncatedNormal(mean=0.0, stddev=0.02),
+					use_bias=False,
+				),
+				layers.BatchNormalization(),
+				layers.ReLU(),
+			),
+		]
+		self.output_conv = layers.Conv2DTranspose(
+			filters=3,
+			kernel_size=3,
+			strides=1,
+			padding="same",
+			activation="tanh",
+			kernel_initializer=tf.keras.initializers.TruncatedNormal(mean=0.0, stddev=0.02),
+		)
+
+	@tf.function
+	def call(self, X):
+		X = self.proj(X)
+		X = self.reshape(X)
+		for conv, norm, act in self.blocks:
+			X = act(norm(conv(X)))
+		X = self.output_conv(X)
+		return X
+
+
 class Discriminator(Model):
 	def __init__(self, n_class=10, res=128):
 		super(Discriminator, self).__init__()
@@ -137,11 +215,98 @@ class Discriminator(Model):
 
 		return x, reconst_x
 
+
+class SimpleDiscriminator(Model):
+	def __init__(self):
+		super(SimpleDiscriminator, self).__init__()
+		self.blocks = [
+			(
+				layers.Conv2D(
+					filters=32,
+					kernel_size=4,
+					strides=2,
+					padding="same",
+					kernel_initializer=tf.keras.initializers.TruncatedNormal(mean=0.0, stddev=0.02),
+				),
+				layers.LeakyReLU(alpha=0.2),
+			),
+			(
+				layers.Conv2D(
+					filters=64,
+					kernel_size=4,
+					strides=2,
+					padding="same",
+					kernel_initializer=tf.keras.initializers.TruncatedNormal(mean=0.0, stddev=0.02),
+					use_bias=False,
+				),
+				layers.BatchNormalization(),
+				layers.LeakyReLU(alpha=0.2),
+			),
+			(
+				layers.Conv2D(
+					filters=128,
+					kernel_size=4,
+					strides=2,
+					padding="same",
+					kernel_initializer=tf.keras.initializers.TruncatedNormal(mean=0.0, stddev=0.02),
+					use_bias=False,
+				),
+				layers.BatchNormalization(),
+				layers.LeakyReLU(alpha=0.2),
+			),
+			(
+				layers.Conv2D(
+					filters=256,
+					kernel_size=4,
+					strides=2,
+					padding="same",
+					kernel_initializer=tf.keras.initializers.TruncatedNormal(mean=0.0, stddev=0.02),
+					use_bias=False,
+				),
+				layers.BatchNormalization(),
+				layers.LeakyReLU(alpha=0.2),
+			),
+		]
+		self.flat = layers.Flatten()
+		self.disc_out = layers.Dense(units=1)
+
+	@tf.function
+	def call(self, x, C):
+		C = tf.expand_dims(tf.expand_dims(C, axis=1), axis=1)
+		C = tf.tile(C, [1, x.shape[1], x.shape[2], 1])
+		x = tf.concat([x, C], axis=-1)
+
+		for block in self.blocks:
+			if len(block) == 2:
+				conv, act = block
+				x = act(conv(x))
+			else:
+				conv, norm, act = block
+				x = act(norm(conv(x)))
+
+		x = self.disc_out(self.flat(x))
+		return x, None
+
 class DCGAN(Model):
 	def __init__(self):
 		super(DCGAN, self).__init__()
 		self.gen    = Generator()
 		self.disc   = Discriminator()
+
+
+class SimpleGAN(Model):
+	def __init__(self):
+		super(SimpleGAN, self).__init__()
+		self.gen = SimpleGenerator()
+		self.disc = SimpleDiscriminator()
+
+
+def build_gan(variant):
+	if variant == "dcgan":
+		return DCGAN()
+	if variant == "simple_gan":
+		return SimpleGAN()
+	raise ValueError(f"Unsupported gan variant: {variant}")
 
 @tf.function
 def dist_train_step(

@@ -10,7 +10,7 @@ from natsort import natsorted
 from tqdm import tqdm
 
 from lstm_kmean.model import TripleNet
-from model import DCGAN, dist_train_step
+from model import build_gan, dist_train_step
 from runtime_utils import build_strategy, ensure_dir, write_json
 from utils import load_complete_data, show_batch_images
 
@@ -34,6 +34,7 @@ def parse_args():
     parser.add_argument("--output_dir", required=True)
     parser.add_argument("--triplet_ckpt_dir", default="lstm_kmean/experiments/best_ckpt")
     parser.add_argument("--triplet_ckpt_path", default="")
+    parser.add_argument("--gan_variant", choices=["simple_gan", "dcgan"], default="dcgan")
     parser.add_argument("--epochs", type=int, default=300)
     parser.add_argument("--batch_size", type=int, default=128)
     parser.add_argument("--latent_dim", type=int, default=128)
@@ -44,8 +45,8 @@ def parse_args():
     parser.add_argument("--checkpoint_every_epochs", type=int, default=10)
     parser.add_argument("--max_to_keep", type=int, default=50)
     parser.add_argument("--max_steps_per_epoch", type=int, default=0)
-    parser.add_argument("--use_diffaug", type=str2bool, default=True)
-    parser.add_argument("--use_mode_loss", type=str2bool, default=True)
+    parser.add_argument("--use_diffaug", type=str2bool, default=False)
+    parser.add_argument("--use_mode_loss", type=str2bool, default=False)
     parser.add_argument("--mode_loss_weight", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=45)
     return parser.parse_args()
@@ -163,6 +164,7 @@ def main():
             "output_dir": os.path.abspath(args.output_dir),
             "triplet_ckpt_dir": os.path.abspath(args.triplet_ckpt_dir),
             "triplet_ckpt_path": triplet_path,
+            "gan_variant": args.gan_variant,
             "epochs": args.epochs,
             "batch_size": args.batch_size,
             "latent_dim": args.latent_dim,
@@ -195,7 +197,7 @@ def main():
 
     strategy = build_strategy()
     with strategy.scope():
-        model = DCGAN()
+        model = build_gan(args.gan_variant)
         model_gopt = tf.keras.optimizers.Adam(
             learning_rate=args.learning_rate,
             beta_1=0.2,

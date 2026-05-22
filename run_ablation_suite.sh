@@ -15,6 +15,7 @@ TEST_IMAGE_COUNT=50000
 DATASET_BATCH_SIZE=64
 GENERATE_BATCH_SIZE=64
 SPLITS=10
+EXPERIMENT_ROOT="experiments/backbone_compare"
 
 timestamp() {
   date -u +"%Y-%m-%dT%H:%M:%SZ"
@@ -26,14 +27,13 @@ log() {
 
 is_training_running() {
   local name="$1"
-  pgrep -af "python train_gan.py.*--output_dir experiments/ablations/${name}( |$)" >/dev/null
+  pgrep -af "python train_gan.py.*--output_dir ${EXPERIMENT_ROOT}/${name}( |$)" >/dev/null
 }
 
 train_experiment() {
   local name="$1"
-  local use_diffaug="$2"
-  local use_mode_loss="$3"
-  local output_dir="experiments/ablations/${name}"
+  local gan_variant="$2"
+  local output_dir="${EXPERIMENT_ROOT}/${name}"
   local ckpt_index="${output_dir}/ckpt/ckpt-210.index"
 
   mkdir -p "$output_dir"
@@ -50,8 +50,9 @@ train_experiment() {
       --data_root "$DATA_ROOT" \
       --output_dir "$output_dir" \
       --epochs "$EPOCHS" \
-      --use_diffaug "$use_diffaug" \
-      --use_mode_loss "$use_mode_loss" \
+      --gan_variant "$gan_variant" \
+      --use_diffaug false \
+      --use_mode_loss false \
       >> "${output_dir}/train.out" 2>&1; then
       log "${name}: training command exited with failure, retrying in 30s"
       sleep 30
@@ -64,8 +65,9 @@ train_experiment() {
 
 evaluate_experiment() {
   local name="$1"
-  local output_dir="experiments/ablations/${name}"
-  local eval_dir="experiments/ablations/${name}_eval"
+  local gan_variant="$2"
+  local output_dir="${EXPERIMENT_ROOT}/${name}"
+  local eval_dir="${EXPERIMENT_ROOT}/${name}_eval"
   local ckpt_path="${output_dir}/ckpt/ckpt-210"
   local result_json="${eval_dir}/inception_score.json"
 
@@ -82,6 +84,7 @@ evaluate_experiment() {
     --output_dir "$eval_dir" \
     --gan_ckpt_dir "${output_dir}/ckpt" \
     --gan_ckpt_path "$ckpt_path" \
+    --gan_variant "$gan_variant" \
     --test_image_count "$TEST_IMAGE_COUNT" \
     --dataset_batch_size "$DATASET_BATCH_SIZE" \
     --generate_batch_size "$GENERATE_BATCH_SIZE" \
@@ -98,21 +101,15 @@ evaluate_experiment() {
 }
 
 main() {
-  log "Starting ablation suite on GPU ${CUDA_VISIBLE_DEVICES}"
+  log "Starting backbone comparison on GPU ${CUDA_VISIBLE_DEVICES}"
 
-  train_experiment baseline false false
-  evaluate_experiment baseline
+  train_experiment simple_gan simple_gan
+  evaluate_experiment simple_gan simple_gan
 
-  train_experiment mode_only false true
-  evaluate_experiment mode_only
+  train_experiment dcgan dcgan
+  evaluate_experiment dcgan dcgan
 
-  train_experiment diffaug_only true false
-  evaluate_experiment diffaug_only
-
-  train_experiment full true true
-  evaluate_experiment full
-
-  log "Ablation suite completed"
+  log "Backbone comparison completed"
 }
 
 main "$@"
