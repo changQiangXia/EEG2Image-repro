@@ -1,153 +1,258 @@
-import tensorflow as tf
-import numpy as np
-from glob import glob
-from natsort import natsorted
+import argparse
+import json
 import os
 import pickle
-try:
-	from lstm_kmean.model import TripleNet, train_step, test_step
-	from lstm_kmean.utils import load_complete_data
-except ImportError:
-	from model import TripleNet, train_step, test_step
-	from utils import load_complete_data
+import sys
+
+import numpy as np
+import tensorflow as tf
 from tqdm import tqdm
-from sklearn.manifold import TSNE
-import matplotlib.pyplot as plt
-from matplotlib import style
-import seaborn as sns
-import pandas as pd
-from sklearn.cluster import KMeans
 
-style.use('seaborn')
+ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if ROOT_DIR not in sys.path:
+	sys.path.insert(0, ROOT_DIR)
 
-np.random.seed(45)
-tf.random.set_seed(45)
-
-if __name__ == '__main__':
-	n_channels  = 14
-	n_feat      = 128
-	batch_size  = 256
-	test_batch_size  = 1
-	n_classes   = 10
-
-	# data_cls = natsorted(glob('data/thoughtviz_eeg_data/*'))
-	# cls2idx  = {key.split(os.path.sep)[-1]:idx for idx, key in enumerate(data_cls, start=0)}
-	# idx2cls  = {value:key for key, value in cls2idx.items()}
-
-	with open('../../data/b2i_data/eeg/image/data.pkl', 'rb') as file:
-		data = pickle.load(file, encoding='latin1')
-		train_X = data['x_train']
-		train_Y = data['y_train']
-		test_X = data['x_test']
-		test_Y = data['y_test']
+from lstm_kmean.model import build_triplenet, test_step, train_step
+from lstm_kmean.utils import load_complete_data
+from runtime_utils import ensure_dir, write_json
 
 
-	# train_batch = load_complete_data('data/thoughtviz_eeg_data/*/train/*', batch_size=batch_size)
-	# val_batch   = load_complete_data('data/thoughtviz_eeg_data/*/val/*', batch_size=batch_size)
-	# test_batch  = load_complete_data('data/thoughtviz_eeg_data/*/test/*', batch_size=test_batch_size)
-	train_batch = load_complete_data(train_X, train_Y, batch_size=batch_size)
-	val_batch   = load_complete_data(test_X, test_Y, batch_size=batch_size)
-	test_batch  = load_complete_data(test_X, test_Y, batch_size=test_batch_size)
-	X, Y = next(iter(train_batch))
+def str2bool(value):
+	if isinstance(value, bool):
+		return value
+	lowered = value.lower()
+	if lowered in {"1", "true", "yes", "y", "on"}:
+		return True
+	if lowered in {"0", "false", "no", "n", "off"}:
+		return False
+	raise argparse.ArgumentTypeError(f"Invalid boolean value: {value}")
 
-	# print(X.shape, Y.shape)
-	triplenet = TripleNet(n_classes=n_classes)
-	opt     = tf.keras.optimizers.Adam(learning_rate=3e-4)
-	triplenet_ckpt    = tf.train.Checkpoint(step=tf.Variable(1), model=triplenet, optimizer=opt)
-	triplenet_ckptman = tf.train.CheckpointManager(triplenet_ckpt, directory='experiments/best_ckpt', max_to_keep=5000)
-	triplenet_ckpt.restore(triplenet_ckptman.latest_checkpoint)
-	START = int(triplenet_ckpt.step) // len(train_batch)
-	if triplenet_ckptman.latest_checkpoint:
-		print('Restored from the latest checkpoint, epoch: {}'.format(START))
-	EPOCHS = 3000
-	cfreq  = 10 # Checkpoint frequency
 
-	for epoch in range(START, EPOCHS):
-		train_acc  = tf.keras.metrics.SparseCategoricalAccuracy()
+def parse_args():
+	parser = argparse.ArgumentParser(description="Train the EEG feature extractor.")
+	parser.add_argument("--data_root", default="data/b2i_data")
+	parser.add_argument("--output_dir", required=True)
+	parser.add_argument("--encoder_variant", choices=["lstm", "attn_lstm", "lstm_respool", "lstm_statpool", "msconv_bilstm", "resmsconv_lstm", "resbilstm_lstm"], default="lstm")
+	parser.add_argument("--warmstart_lstm_ckpt", default="")
+	parser.add_argument("--freeze_warmstart_lstm", type=str2bool, default=False)
+	parser.add_argument("--restore_ckpt_path", default="")
+	parser.add_argument("--epochs", type=int, default=3000)
+	parser.add_argument("--batch_size", type=int, default=256)
+	parser.add_argument("--feature_dim", type=int, default=128)
+	parser.add_argument("--learning_rate", type=float, default=3e-4)
+	parser.add_argument("--checkpoint_every_epochs", type=int, default=10)
+	parser.add_argument("--max_to_keep", type=int, default=5000)
+	parser.add_argument("--max_steps_per_epoch", type=int, default=0)
+	parser.add_argument("--seed", type=int, default=45)
+	parser.add_argument("--msconv_branch_filters", type=int, default=32)
+	parser.add_argument("--msconv_kernel_sizes", type=str, default="3,5,7")
+	parser.add_argument("--msconv_dropout", type=float, default=0.1)
+	return parser.parse_args()
+
+
+def append_jsonl(path, payload):
+	with open(path, "a", encoding="utf-8") as file:
+		file.write(json.dumps(payload, ensure_ascii=False) + "\n")
+
+
+def write_best_checkpoint(output_dir, epoch, val_loss, checkpoint_path):
+	write_json(
+		os.path.join(output_dir, "best_checkpoint.json"),
+		{
+			"epoch": int(epoch),
+			"val_loss": float(val_loss),
+			"checkpoint_path": checkpoint_path,
+		},
+	)
+
+
+def main():
+	args = parse_args()
+	np.random.seed(args.seed)
+	tf.random.set_seed(args.seed)
+	msconv_kernel_sizes = tuple(int(value) for value in args.msconv_kernel_sizes.split(",") if value)
+
+	with open(os.path.join(args.data_root, "eeg", "image", "data.pkl"), "rb") as file:
+		data = pickle.load(file, encoding="latin1")
+
+	train_x = data["x_train"]
+	train_y = data["y_train"]
+	test_x = data["x_test"]
+	test_y = data["y_test"]
+
+	train_batch = load_complete_data(train_x, train_y, batch_size=args.batch_size)
+	val_batch = load_complete_data(test_x, test_y, batch_size=args.batch_size)
+	steps_per_epoch = int(tf.data.experimental.cardinality(train_batch).numpy())
+
+	model = build_triplenet(
+		n_classes=train_y.shape[1],
+		n_features=args.feature_dim,
+		encoder_variant=args.encoder_variant,
+		msconv_branch_filters=args.msconv_branch_filters,
+		msconv_kernel_sizes=msconv_kernel_sizes,
+		msconv_dropout=args.msconv_dropout,
+	)
+	# Build variables before optional warm-start so nested/lazy layers can receive weights.
+	build_x, _ = next(iter(train_batch))
+	_ = model(build_x[:1], training=False)
+	opt = tf.keras.optimizers.Adam(learning_rate=args.learning_rate)
+
+	if args.encoder_variant in {"lstm_respool", "resmsconv_lstm", "resbilstm_lstm"} and args.warmstart_lstm_ckpt:
+		baseline_model = build_triplenet(
+			n_classes=train_y.shape[1],
+			n_features=args.feature_dim,
+			encoder_variant="lstm",
+		)
+		_ = baseline_model(build_x[:1], training=False)
+		baseline_opt = tf.keras.optimizers.Adam(learning_rate=args.learning_rate)
+		baseline_ckpt = tf.train.Checkpoint(
+			step=tf.Variable(1),
+			model=baseline_model,
+			optimizer=baseline_opt,
+		)
+		baseline_ckpt.restore(args.warmstart_lstm_ckpt).expect_partial()
+		if args.encoder_variant == "lstm_respool":
+			for idx in range(2):
+				model.encoder[idx].set_weights(baseline_model.encoder[idx].get_weights())
+		elif args.encoder_variant == "resmsconv_lstm":
+			model.encoder.lstm_1.set_weights(baseline_model.encoder[0].get_weights())
+			model.encoder.lstm_2.set_weights(baseline_model.encoder[1].get_weights())
+		elif args.encoder_variant == "resbilstm_lstm":
+			model.encoder.lstm_1.set_weights(baseline_model.encoder[0].get_weights())
+			model.encoder.lstm_2.set_weights(baseline_model.encoder[1].get_weights())
+		if args.freeze_warmstart_lstm:
+			if args.encoder_variant == "lstm_respool":
+				for idx in range(2):
+					model.encoder[idx].trainable = False
+			else:
+				model.encoder.lstm_1.trainable = False
+				model.encoder.lstm_2.trainable = False
+		print(f"Warm-started {args.encoder_variant} from {args.warmstart_lstm_ckpt}")
+
+	ensure_dir(args.output_dir)
+	ckpt_dir = os.path.join(args.output_dir, "ckpt")
+	log_path = os.path.join(args.output_dir, "train_log.jsonl")
+	best_state_path = os.path.join(args.output_dir, "best_checkpoint.json")
+	write_json(
+		os.path.join(args.output_dir, "config.json"),
+		{
+			"data_root": os.path.abspath(args.data_root),
+			"output_dir": os.path.abspath(args.output_dir),
+			"encoder_variant": args.encoder_variant,
+			"epochs": args.epochs,
+			"batch_size": args.batch_size,
+			"feature_dim": args.feature_dim,
+			"learning_rate": args.learning_rate,
+			"checkpoint_every_epochs": args.checkpoint_every_epochs,
+			"max_to_keep": args.max_to_keep,
+			"max_steps_per_epoch": args.max_steps_per_epoch,
+			"seed": args.seed,
+			"warmstart_lstm_ckpt": args.warmstart_lstm_ckpt,
+			"freeze_warmstart_lstm": args.freeze_warmstart_lstm,
+			"restore_ckpt_path": args.restore_ckpt_path,
+			"msconv_branch_filters": args.msconv_branch_filters,
+			"msconv_kernel_sizes": list(msconv_kernel_sizes),
+			"msconv_dropout": args.msconv_dropout,
+		},
+	)
+
+	ckpt = tf.train.Checkpoint(
+		step=tf.Variable(1),
+		epoch=tf.Variable(0),
+		model=model,
+		optimizer=opt,
+	)
+	ckpt_manager = tf.train.CheckpointManager(
+		ckpt,
+		directory=ckpt_dir,
+		max_to_keep=args.max_to_keep,
+	)
+	if args.restore_ckpt_path:
+		ckpt.restore(args.restore_ckpt_path).expect_partial()
+		print(f"Restored from explicit checkpoint {args.restore_ckpt_path}")
+	elif ckpt_manager.latest_checkpoint:
+		ckpt.restore(ckpt_manager.latest_checkpoint).expect_partial()
+		print(f"Restored from {ckpt_manager.latest_checkpoint}")
+
+	best_val_loss = float("inf")
+	if os.path.exists(best_state_path):
+		with open(best_state_path, "r", encoding="utf-8") as file:
+			best_state = json.load(file)
+		best_val_loss = float(best_state.get("val_loss", best_val_loss))
+
+	step_value = int(ckpt.step.numpy())
+	epoch_value = int(ckpt.epoch.numpy())
+	if epoch_value > 0:
+		start_epoch = epoch_value
+	elif step_value > steps_per_epoch * 2:
+		# Legacy checkpoints stored global batch steps, not epochs.
+		start_epoch = step_value // steps_per_epoch
+	else:
+		start_epoch = max(step_value - 1, 0)
+	ckpt.epoch.assign(start_epoch)
+
+	for epoch in range(start_epoch, args.epochs):
 		train_loss = tf.keras.metrics.Mean()
-		test_acc   = tf.keras.metrics.SparseCategoricalAccuracy()
-		test_loss  = tf.keras.metrics.Mean()
+		val_loss = tf.keras.metrics.Mean()
 
-		tq = tqdm(train_batch)
-		for idx, (X, Y) in enumerate(tq, start=1):
-			loss = train_step(triplenet, opt, X, Y)
+		tq = tqdm(train_batch, desc=f"Train Epoch {epoch + 1}/{args.epochs}")
+		for step, (X, Y) in enumerate(tq, start=1):
+			if args.max_steps_per_epoch and step > args.max_steps_per_epoch:
+				break
+			loss = train_step(model, opt, X, Y)
 			train_loss.update_state(loss)
-			# Y_cap = triplenet(X, training=False)
-			# train_acc.update_state(Y, Y_cap)
-			# tq.set_description('Train Epoch: {}, Loss: {}, Acc: {}'.format(epoch, train_loss.result(), train_acc.result()))
-			tq.set_description('Train Epoch: {}, Loss: {}'.format(epoch, train_loss.result()))
-			# break
+			ckpt.step.assign_add(1)
+			tq.set_description(
+				f"Train Epoch {epoch + 1}/{args.epochs} loss={train_loss.result():0.4f}"
+			)
 
-		tq = tqdm(val_batch)
-		for idx, (X, Y) in enumerate(tq, start=1):
-			loss = test_step(triplenet, X, Y)
-			test_loss.update_state(loss)
-			# Y_cap = triplenet(X, training=False)
-			# test_acc.update_state(Y, Y_cap)
-			# tq.set_description('Test Epoch: {}, Loss: {}'.format(epoch, test_loss.result(), test_acc.result()))
-			tq.set_description('Test Epoch: {}, Loss: {}'.format(epoch, test_loss.result()))
-			# break
-   
-		triplenet_ckpt.step.assign_add(1)
-		if (epoch%cfreq) == 0:
-			triplenet_ckptman.save()
+		tq = tqdm(val_batch, desc=f"Val Epoch {epoch + 1}/{args.epochs}")
+		for step, (X, Y) in enumerate(tq, start=1):
+			if args.max_steps_per_epoch and step > args.max_steps_per_epoch:
+				break
+			loss = test_step(model, X, Y)
+			val_loss.update_state(loss)
+			tq.set_description(
+				f"Val Epoch {epoch + 1}/{args.epochs} loss={val_loss.result():0.4f}"
+			)
 
-	# kmeanacc = 0.0
-	# tq = tqdm(test_batch)
-	# feat_X = []
-	# feat_Y = []
-	# for idx, (X, Y) in enumerate(tq, start=1):
-	# 	_, feat = triplenet(X, training=False)
-	# 	feat_X.extend(feat.numpy())
-	# 	feat_Y.extend(Y.numpy())
-	# feat_X = np.array(feat_X)
-	# feat_Y = np.array(feat_Y)
-	# print(feat_X.shape, feat_Y.shape)
-	# # colors = list(plt.cm.get_cmap('viridis', 10))
-	# # print(colors)
-	# # colors  = [np.random.rand(3,) for _ in range(10)]
-	# # print(colors)
-	# # Y_color = [colors[label] for label in feat_Y]
+		ckpt.epoch.assign(epoch + 1)
+		payload = {
+			"epoch": epoch + 1,
+			"step": int(ckpt.step.numpy()),
+			"train_loss": float(train_loss.result().numpy()),
+			"val_loss": float(val_loss.result().numpy()),
+			"encoder_variant": args.encoder_variant,
+		}
+		append_jsonl(log_path, payload)
+		print(payload)
 
-	# tsne = TSNE(n_components=2, verbose=1, perplexity=40, n_iter=700)
-	# tsne_results = tsne.fit_transform(feat_X)
-	# df = pd.DataFrame()
-	# df['label'] = feat_Y
-	# df['x1'] = tsne_results[:, 0]
-	# df['x2'] = tsne_results[:, 1]
-	# # df['x3'] = tsne_results[:, 2]
-	# df.to_csv('experiments/inference/triplet_embed2D.csv')
-	
-	# # df.to_csv('experiments/triplenet_embed3D.csv')
-	# # df = pd.read_csv('experiments/triplenet_embed2D.csv')
-	
-	# df = pd.read_csv('experiments/inference/triplet_embed2D.csv')
+		saved_path = ""
+		if args.checkpoint_every_epochs and (epoch + 1) % args.checkpoint_every_epochs == 0:
+			saved_path = ckpt_manager.save(checkpoint_number=epoch + 1)
+			print(f"Saved checkpoint: {saved_path}")
 
-	# plt.figure(figsize=(16,10))
-	
-	# # ax = plt.axes(projection='3d')
-	# sns.scatterplot(
-	#     x="x1", y="x2",
-	#     data=df,
-	#     hue='label',
-	#     palette=sns.color_palette("hls", n_classes),
-	#     legend="full",
-	#     alpha=0.4
-	#     )
+		current_val_loss = float(val_loss.result().numpy())
+		if current_val_loss < best_val_loss:
+			if not saved_path:
+				saved_path = ckpt_manager.save(checkpoint_number=epoch + 1)
+				print(f"Saved checkpoint: {saved_path}")
+			best_val_loss = current_val_loss
+			write_best_checkpoint(
+				args.output_dir,
+				epoch=epoch + 1,
+				val_loss=best_val_loss,
+				checkpoint_path=saved_path,
+			)
+			print(
+				f"Best checkpoint updated: epoch={epoch + 1}, "
+				f"val_loss={best_val_loss:0.6f}, path={saved_path}"
+			)
 
-	# plt.show()
-	# # plt.savefig('experiments/inference/{}_embedding.png'.format(epoch))
+	final_epoch = int(ckpt.epoch.numpy())
+	final_path = ckpt_manager.save(checkpoint_number=final_epoch)
+	print(f"Final checkpoint: {final_path}")
 
-	# kmeans = KMeans(n_clusters=n_classes,random_state=45)
-	# kmeans.fit(feat_X)
-	# labels = kmeans.labels_
-	# # print(feat_Y, labels)
-	# correct_labels = sum(feat_Y == labels)
-	# print("Result: %d out of %d samples were correctly labeled." % (correct_labels, feat_Y.shape[0]))
-	# kmeanacc = correct_labels/float(feat_Y.shape[0])
-	# print('Accuracy score: {0:0.2f}'. format(kmeanacc))
 
-	# with open('experiments/triplenet_log.txt', 'a') as file:
-	# 	file.write('E: {}, Train Loss: {}, Test Loss: {}, KM Acc: {}\n'.\
-	# 		format(epoch, train_loss.result(), test_loss.result(), kmeanacc))
-	# break
+if __name__ == "__main__":
+	main()

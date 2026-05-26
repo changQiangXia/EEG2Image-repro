@@ -7,7 +7,6 @@ from skimage.transform import resize
 from tifffile import imwrite
 import numpy as np
 import cv2
-from save_figure import save_figure, save_figure_condition
 import h5py
 from functools import partial
 import tensorflow_io as tfio

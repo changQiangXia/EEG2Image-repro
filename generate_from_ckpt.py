@@ -10,10 +10,27 @@ import tensorflow as tf
 from natsort import natsorted
 from tqdm import tqdm
 
-from lstm_kmean.model import TripleNet
+from conditioning_utils import (
+    compose_condition_vector,
+    compute_class_prototypes,
+    select_condition_vector,
+)
+from lstm_kmean.model import build_triplenet
+from lstm_kmean.utils import load_complete_data as load_feature_data
 from model import DCGAN
 from runtime_utils import configure_runtime, ensure_dir, write_json
 from utils import load_complete_data
+
+
+def str2bool(value):
+    if isinstance(value, bool):
+        return value
+    lowered = value.lower()
+    if lowered in {"1", "true", "yes", "y", "on"}:
+        return True
+    if lowered in {"0", "false", "no", "n", "off"}:
+        return False
+    raise argparse.ArgumentTypeError(f"Invalid boolean value: {value}")
 
 
 def parse_args():
@@ -24,6 +41,22 @@ def parse_args():
     parser.add_argument("--output_dir", default="experiments/checkpoint_validation/ckpt_210")
     parser.add_argument("--triplet_ckpt_dir", default="lstm_kmean/experiments/best_ckpt")
     parser.add_argument("--triplet_ckpt_path", default="")
+    parser.add_argument("--encoder_variant", choices=["lstm", "attn_lstm", "lstm_respool", "lstm_statpool", "msconv_bilstm", "resmsconv_lstm", "resbilstm_lstm"], default="lstm")
+    parser.add_argument(
+        "--condition_source",
+        choices=["feat", "embedding", "feat_l2norm"],
+        default="feat",
+    )
+    parser.add_argument(
+        "--condition_strategy",
+        choices=["direct", "prototype_residual"],
+        default="direct",
+    )
+    parser.add_argument("--condition_scale", type=float, default=1.0)
+    parser.add_argument("--prototype_alpha", type=float, default=1.0)
+    parser.add_argument("--prototype_batch_size", type=int, default=256)
+    parser.add_argument("--post_mix_l2norm", type=str2bool, default=False)
+    parser.add_argument("--use_label_condition", type=str2bool, default=False)
     parser.add_argument("--gan_ckpt_dir", default="experiments/best_ckpt")
     parser.add_argument("--gan_ckpt_path", default="")
     parser.add_argument("--reference_split", default="test")
@@ -32,6 +65,24 @@ def parse_args():
     parser.add_argument("--generate_batch_size", type=int, default=64)
     parser.add_argument("--latent_dim", type=int, default=128)
     parser.add_argument("--seed", type=int, default=45)
+    parser.add_argument("--msconv_branch_filters", type=int, default=32)
+    parser.add_argument("--msconv_kernel_sizes", type=str, default="3,5,7")
+    parser.add_argument("--msconv_dropout", type=float, default=0.1)
+    parser.add_argument(
+        "--gen_label_mode",
+        choices=["none", "latent_bias"],
+        default="none",
+    )
+    parser.add_argument(
+        "--disc_condition_mode",
+        choices=["concat", "concat_proj"],
+        default="concat",
+    )
+    parser.add_argument(
+        "--disc_label_mode",
+        choices=["none", "projection"],
+        default="none",
+    )
     return parser.parse_args()
 
 
@@ -70,12 +121,40 @@ def compute_target_counts(total_count, n_classes):
     return [base + (1 if class_idx < remainder else 0) for class_idx in range(n_classes)]
 
 
-def extract_feature_bank(test_batch, triplenet, n_classes, latent_dim, target_counts):
+def extract_feature_bank(
+    test_batch,
+    triplenet,
+    n_classes,
+    target_counts,
+    condition_source,
+    condition_scale,
+    condition_strategy,
+    class_prototypes,
+    prototype_alpha,
+    post_mix_l2norm,
+    use_label_condition,
+):
     feature_bank = {class_idx: [] for class_idx in range(n_classes)}
     iterator = tqdm(test_batch, desc="Extracting test EEG features")
     for eeg_batch, label_batch, _ in iterator:
         labels = label_batch.numpy().astype(np.int32)
-        features = triplenet(eeg_batch, training=False)[1].numpy().astype(np.float32)
+        embedding, features = triplenet(eeg_batch, training=False)
+        features = select_condition_vector(
+            embedding,
+            features,
+            condition_source=condition_source,
+            condition_scale=condition_scale,
+        )
+        features = compose_condition_vector(
+            features,
+            label_batch,
+            n_classes=n_classes,
+            condition_strategy=condition_strategy,
+            class_prototypes=class_prototypes,
+            prototype_alpha=prototype_alpha,
+            post_mix_l2norm=post_mix_l2norm,
+            use_label_condition=use_label_condition,
+        ).numpy().astype(np.float32)
         for label_idx, feature in zip(labels, features):
             feature_bank[int(label_idx)].append(np.squeeze(feature))
 
@@ -85,9 +164,10 @@ def extract_feature_bank(test_batch, triplenet, n_classes, latent_dim, target_co
         if features.size == 0:
             raise ValueError(f"No EEG features collected for class index {class_idx}")
         repeat_factor = int(math.ceil(target_counts[class_idx] / features.shape[0]))
+        condition_dim = features.shape[1]
         tiled = np.expand_dims(features, axis=1)
         tiled = np.tile(tiled, [1, repeat_factor, 1])
-        tiled = np.reshape(tiled, [-1, latent_dim])[: target_counts[class_idx]]
+        tiled = np.reshape(tiled, [-1, condition_dim])[: target_counts[class_idx]]
         expanded_bank[class_idx] = tiled
     return expanded_bank
 
@@ -115,7 +195,9 @@ def generate_images(model, class_names, feature_bank, target_counts, output_dir,
         iterator = range(0, latent.shape[0], batch_size)
         for start in tqdm(iterator, desc=f"Generating {class_name}"):
             batch_latent = tf.convert_to_tensor(latent[start : start + batch_size], dtype=tf.float32)
-            generated = model.gen(batch_latent, training=False).numpy()
+            batch_size_actual = batch_latent.shape[0]
+            batch_labels = tf.fill([batch_size_actual], tf.cast(class_idx, tf.int32))
+            generated = model.gen(batch_latent, labels=batch_labels, training=False).numpy()
             for offset, image in enumerate(generated):
                 image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
                 image = np.uint8(np.clip((image * 0.5 + 0.5) * 255.0, 0, 255))
@@ -129,6 +211,7 @@ def main():
     configure_runtime()
     tf.random.set_seed(args.seed)
     np.random.seed(args.seed)
+    msconv_kernel_sizes = tuple(int(value) for value in args.msconv_kernel_sizes.split(",") if value)
 
     class_names = discover_class_names(args.data_root)
     n_classes = len(class_names)
@@ -137,6 +220,8 @@ def main():
     with open(os.path.join(args.data_root, "eeg", "image", "data.pkl"), "rb") as file:
         data = pickle.load(file, encoding="latin1")
 
+    train_x = data["x_train"]
+    train_y = data["y_train"]
     test_x = data["x_test"]
     test_y = data["y_test"]
     train_label_counts = np.bincount(np.argmax(data["y_train"], axis=1), minlength=n_classes).tolist()
@@ -151,7 +236,14 @@ def main():
         dataset_type="eval",
     )
 
-    triplenet = TripleNet(n_classes=n_classes)
+    triplenet = build_triplenet(
+        n_classes=n_classes,
+        n_features=args.latent_dim,
+        encoder_variant=args.encoder_variant,
+        msconv_branch_filters=args.msconv_branch_filters,
+        msconv_kernel_sizes=msconv_kernel_sizes,
+        msconv_dropout=args.msconv_dropout,
+    )
     triplet_opt = tf.keras.optimizers.Adam(learning_rate=3e-4)
     triplet_ckpt = tf.train.Checkpoint(step=tf.Variable(1), model=triplenet, optimizer=triplet_opt)
     triplet_manager = tf.train.CheckpointManager(
@@ -166,15 +258,43 @@ def main():
     )
     triplet_ckpt.restore(triplet_path).expect_partial()
 
+    class_prototypes = None
+    if args.condition_strategy == "prototype_residual":
+        prototype_batch = load_feature_data(
+            train_x,
+            train_y,
+            batch_size=args.prototype_batch_size,
+        )
+        class_prototypes = compute_class_prototypes(
+            prototype_batch,
+            triplenet,
+            n_classes=n_classes,
+            condition_source=args.condition_source,
+            condition_scale=args.condition_scale,
+        )
+
     feature_bank = extract_feature_bank(
         test_batch,
         triplenet,
         n_classes=n_classes,
-        latent_dim=args.latent_dim,
         target_counts=target_counts,
+        condition_source=args.condition_source,
+        condition_scale=args.condition_scale,
+        condition_strategy=args.condition_strategy,
+        class_prototypes=class_prototypes,
+        prototype_alpha=args.prototype_alpha,
+        post_mix_l2norm=args.post_mix_l2norm,
+        use_label_condition=args.use_label_condition,
     )
 
-    model = DCGAN()
+    condition_dim = int(next(iter(feature_bank.values())).shape[1])
+    model = DCGAN(
+        n_classes=n_classes,
+        gen_input_dim=args.latent_dim + condition_dim,
+        gen_label_mode=args.gen_label_mode,
+        disc_condition_mode=args.disc_condition_mode,
+        disc_label_mode=args.disc_label_mode,
+    )
     model_gopt = tf.keras.optimizers.Adam(learning_rate=3e-4, beta_1=0.2, beta_2=0.5)
     model_copt = tf.keras.optimizers.Adam(learning_rate=3e-4, beta_1=0.2, beta_2=0.5)
     gan_ckpt = tf.train.Checkpoint(step=tf.Variable(1), model=model, gopt=model_gopt, copt=model_copt)
@@ -194,6 +314,14 @@ def main():
             "output_dir": os.path.abspath(args.output_dir),
             "triplet_ckpt_dir": os.path.abspath(args.triplet_ckpt_dir),
             "triplet_ckpt_path": triplet_path,
+            "encoder_variant": args.encoder_variant,
+            "condition_source": args.condition_source,
+            "condition_strategy": args.condition_strategy,
+            "condition_scale": args.condition_scale,
+            "prototype_alpha": args.prototype_alpha,
+            "prototype_batch_size": args.prototype_batch_size,
+            "post_mix_l2norm": args.post_mix_l2norm,
+            "use_label_condition": args.use_label_condition,
             "gan_ckpt_dir": os.path.abspath(args.gan_ckpt_dir),
             "gan_ckpt_path": gan_path,
             "reference_split": args.reference_split,
@@ -202,10 +330,18 @@ def main():
             "dataset_batch_size": args.dataset_batch_size,
             "generate_batch_size": args.generate_batch_size,
             "seed": args.seed,
+            "msconv_branch_filters": args.msconv_branch_filters,
+            "msconv_kernel_sizes": list(msconv_kernel_sizes),
+            "msconv_dropout": args.msconv_dropout,
+            "gen_label_mode": args.gen_label_mode,
+            "disc_condition_mode": args.disc_condition_mode,
+            "disc_label_mode": args.disc_label_mode,
             "class_names": class_names,
             "target_counts": target_counts,
             "train_label_counts": train_label_counts,
             "test_label_counts": test_label_counts,
+            "condition_dim": condition_dim,
+            "prototype_shape": list(class_prototypes.shape) if class_prototypes is not None else None,
             "reference_image_counts": {
                 class_name: len(image_dict[class_name]) for class_name in class_names
             },

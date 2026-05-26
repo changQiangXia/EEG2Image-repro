@@ -76,6 +76,10 @@ def _init_inception():
   with tf.Session() as sess:
     input_tensor = sess.graph.get_tensor_by_name('ExpandDims:0')
     input_tensor.set_shape(tf.TensorShape([None, None, None, 3]))
+    try:
+      input_tensor._shape_val = tf.TensorShape([None, None, None, 3])
+    except Exception:
+      pass
     pool3 = sess.graph.get_tensor_by_name('pool_3:0')
     ops = pool3.graph.get_operations()
     for op_idx, op in enumerate(ops):
@@ -89,6 +93,10 @@ def _init_inception():
                 else:
                     new_shape.append(s)
             o.set_shape(tf.TensorShape(new_shape))
+            try:
+              o._shape_val = tf.TensorShape(new_shape)
+            except Exception:
+              pass
     w = sess.graph.get_operation_by_name("softmax/logits/MatMul").inputs[1]
     logits = tf.matmul(tf.squeeze(pool3, [1, 2]), w)
     softmax = tf.nn.softmax(logits)

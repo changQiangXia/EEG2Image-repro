@@ -9,9 +9,15 @@ import tensorflow as tf
 from natsort import natsorted
 from tqdm import tqdm
 
-from lstm_kmean.model import TripleNet
+from conditioning_utils import (
+    compose_condition_vector,
+    compute_class_prototypes,
+    select_condition_vector,
+)
+from lstm_kmean.model import build_triplenet
+from lstm_kmean.utils import load_complete_data as load_feature_data
 from model import DCGAN, dist_train_step
-from runtime_utils import build_strategy, ensure_dir, write_json
+from runtime_utils import build_strategy, configure_runtime, ensure_dir, write_json
 from utils import load_complete_data, show_batch_images
 
 
@@ -34,6 +40,24 @@ def parse_args():
     parser.add_argument("--output_dir", required=True)
     parser.add_argument("--triplet_ckpt_dir", default="lstm_kmean/experiments/best_ckpt")
     parser.add_argument("--triplet_ckpt_path", default="")
+    parser.add_argument("--gan_init_ckpt_dir", default="")
+    parser.add_argument("--gan_init_ckpt_path", default="")
+    parser.add_argument("--encoder_variant", choices=["lstm", "attn_lstm", "lstm_respool", "lstm_statpool", "msconv_bilstm", "resmsconv_lstm", "resbilstm_lstm"], default="lstm")
+    parser.add_argument(
+        "--condition_source",
+        choices=["feat", "embedding", "feat_l2norm"],
+        default="feat",
+    )
+    parser.add_argument(
+        "--condition_strategy",
+        choices=["direct", "prototype_residual"],
+        default="direct",
+    )
+    parser.add_argument("--condition_scale", type=float, default=1.0)
+    parser.add_argument("--prototype_alpha", type=float, default=1.0)
+    parser.add_argument("--prototype_batch_size", type=int, default=256)
+    parser.add_argument("--post_mix_l2norm", type=str2bool, default=False)
+    parser.add_argument("--use_label_condition", type=str2bool, default=False)
     parser.add_argument("--epochs", type=int, default=300)
     parser.add_argument("--batch_size", type=int, default=128)
     parser.add_argument("--latent_dim", type=int, default=128)
@@ -48,6 +72,24 @@ def parse_args():
     parser.add_argument("--use_mode_loss", type=str2bool, default=True)
     parser.add_argument("--mode_loss_weight", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=45)
+    parser.add_argument("--msconv_branch_filters", type=int, default=32)
+    parser.add_argument("--msconv_kernel_sizes", type=str, default="3,5,7")
+    parser.add_argument("--msconv_dropout", type=float, default=0.1)
+    parser.add_argument(
+        "--gen_label_mode",
+        choices=["none", "latent_bias"],
+        default="none",
+    )
+    parser.add_argument(
+        "--disc_condition_mode",
+        choices=["concat", "concat_proj"],
+        default="concat",
+    )
+    parser.add_argument(
+        "--disc_label_mode",
+        choices=["none", "projection"],
+        default="none",
+    )
     return parser.parse_args()
 
 
@@ -87,9 +129,18 @@ def resolve_triplet_checkpoint(manager, explicit_path):
     return ckpt_path
 
 
+def resolve_optional_checkpoint(manager, explicit_path):
+    if explicit_path:
+        return explicit_path
+    if manager is None:
+        return ""
+    return manager.latest_checkpoint
+
+
 def save_sample_grid(model, latent, labels, sample_dir, tag):
     ensure_dir(sample_dir)
-    generated = model.gen(latent, training=False)
+    label_tensor = tf.convert_to_tensor(labels, dtype=tf.int32)
+    generated = model.gen(latent, labels=label_tensor, training=False)
     show_batch_images(generated, os.path.join(sample_dir, f"{tag}.png"), Y=labels)
 
 
@@ -100,9 +151,11 @@ def append_jsonl(path, payload):
 
 def main():
     args = parse_args()
+    configure_runtime()
     tf.random.set_seed(args.seed)
     np.random.seed(args.seed)
     rng = np.random.default_rng(args.seed)
+    msconv_kernel_sizes = tuple(int(value) for value in args.msconv_kernel_sizes.split(",") if value)
 
     class_names = discover_class_names(args.data_root)
     n_classes = len(class_names)
@@ -128,7 +181,14 @@ def main():
     sample_batch = next(iter(train_batch))
     sample_eeg, sample_labels, _ = sample_batch
 
-    triplenet = TripleNet(n_classes=n_classes)
+    triplenet = build_triplenet(
+        n_classes=n_classes,
+        n_features=args.latent_dim,
+        encoder_variant=args.encoder_variant,
+        msconv_branch_filters=args.msconv_branch_filters,
+        msconv_kernel_sizes=msconv_kernel_sizes,
+        msconv_dropout=args.msconv_dropout,
+    )
     triplet_opt = tf.keras.optimizers.Adam(learning_rate=3e-4)
     triplet_ckpt = tf.train.Checkpoint(step=tf.Variable(1), model=triplenet, optimizer=triplet_opt)
     triplet_manager = tf.train.CheckpointManager(
@@ -139,17 +199,48 @@ def main():
     triplet_path = resolve_triplet_checkpoint(triplet_manager, args.triplet_ckpt_path)
     triplet_ckpt.restore(triplet_path).expect_partial()
 
-    _, sample_features = triplenet(sample_eeg, training=False)
+    class_prototypes = None
+    if args.condition_strategy == "prototype_residual":
+        prototype_batch = load_feature_data(
+            train_x,
+            train_y,
+            batch_size=args.prototype_batch_size,
+        )
+        class_prototypes = compute_class_prototypes(
+            prototype_batch,
+            triplenet,
+            n_classes=n_classes,
+            condition_source=args.condition_source,
+            condition_scale=args.condition_scale,
+        )
+
+    sample_embedding, sample_features = triplenet(sample_eeg, training=False)
+    sample_condition_base = select_condition_vector(
+        sample_embedding,
+        sample_features,
+        condition_source=args.condition_source,
+        condition_scale=args.condition_scale,
+    )
+    sample_condition = compose_condition_vector(
+        sample_condition_base,
+        sample_labels,
+        n_classes=n_classes,
+        condition_strategy=args.condition_strategy,
+        class_prototypes=class_prototypes,
+        prototype_alpha=args.prototype_alpha,
+        post_mix_l2norm=args.post_mix_l2norm,
+        use_label_condition=args.use_label_condition,
+    )
     if int(sample_features.shape[0]) < 4:
         raise ValueError("batch_size must be at least 4 so sample grids can be rendered.")
-    sample_count = min(args.sample_count, int(sample_features.shape[0]))
+    sample_count = min(args.sample_count, int(sample_condition.shape[0]))
     sample_count = max(4, sample_count - (sample_count % 4))
     fixed_noise = tf.random.uniform(
         shape=(sample_count, args.latent_dim),
         minval=-0.2,
         maxval=0.2,
     )
-    fixed_latent = tf.concat([fixed_noise, sample_features[:sample_count]], axis=-1)
+    fixed_latent = tf.concat([fixed_noise, sample_condition[:sample_count]], axis=-1)
     fixed_labels = sample_labels[:sample_count].numpy()
 
     ensure_dir(args.output_dir)
@@ -163,6 +254,16 @@ def main():
             "output_dir": os.path.abspath(args.output_dir),
             "triplet_ckpt_dir": os.path.abspath(args.triplet_ckpt_dir),
             "triplet_ckpt_path": triplet_path,
+            "gan_init_ckpt_dir": os.path.abspath(args.gan_init_ckpt_dir) if args.gan_init_ckpt_dir else "",
+            "gan_init_ckpt_path": args.gan_init_ckpt_path,
+            "encoder_variant": args.encoder_variant,
+            "condition_source": args.condition_source,
+            "condition_strategy": args.condition_strategy,
+            "condition_scale": args.condition_scale,
+            "prototype_alpha": args.prototype_alpha,
+            "prototype_batch_size": args.prototype_batch_size,
+            "post_mix_l2norm": args.post_mix_l2norm,
+            "use_label_condition": args.use_label_condition,
             "epochs": args.epochs,
             "batch_size": args.batch_size,
             "latent_dim": args.latent_dim,
@@ -177,10 +278,18 @@ def main():
             "use_mode_loss": args.use_mode_loss,
             "mode_loss_weight": args.mode_loss_weight,
             "seed": args.seed,
+            "msconv_branch_filters": args.msconv_branch_filters,
+            "msconv_kernel_sizes": list(msconv_kernel_sizes),
+            "msconv_dropout": args.msconv_dropout,
+            "gen_label_mode": args.gen_label_mode,
+            "disc_condition_mode": args.disc_condition_mode,
+            "disc_label_mode": args.disc_label_mode,
             "class_names": class_names,
             "train_label_counts": np.bincount(np.argmax(train_y, axis=1), minlength=n_classes).tolist(),
             "test_label_counts": np.bincount(np.argmax(test_y, axis=1), minlength=n_classes).tolist(),
             "train_image_counts": {name: len(train_image_dict[name]) for name in class_names},
+            "condition_dim": int(sample_condition.shape[-1]),
+            "prototype_shape": list(class_prototypes.shape) if class_prototypes is not None else None,
         },
     )
 
@@ -194,8 +303,15 @@ def main():
         )
 
     strategy = build_strategy()
+    gen_input_dim = args.latent_dim + int(sample_condition.shape[-1])
     with strategy.scope():
-        model = DCGAN()
+        model = DCGAN(
+            n_classes=n_classes,
+            gen_input_dim=gen_input_dim,
+            gen_label_mode=args.gen_label_mode,
+            disc_condition_mode=args.disc_condition_mode,
+            disc_label_mode=args.disc_label_mode,
+        )
         model_gopt = tf.keras.optimizers.Adam(
             learning_rate=args.learning_rate,
             beta_1=0.2,
@@ -221,6 +337,21 @@ def main():
         if ckpt_manager.latest_checkpoint:
             ckpt.restore(ckpt_manager.latest_checkpoint).expect_partial()
             print(f"Resumed from {ckpt_manager.latest_checkpoint}")
+        else:
+            init_manager = None
+            init_path = None
+            if args.gan_init_ckpt_dir:
+                init_manager = tf.train.CheckpointManager(
+                    ckpt,
+                    directory=args.gan_init_ckpt_dir,
+                    max_to_keep=1,
+                )
+            init_path = resolve_optional_checkpoint(init_manager, args.gan_init_ckpt_path)
+            if init_path:
+                ckpt.restore(init_path).expect_partial()
+                ckpt.step.assign(0)
+                ckpt.epoch.assign(0)
+                print(f"Initialized GAN weights from {init_path}")
 
     start_epoch = int(ckpt.epoch.numpy())
     for epoch in range(start_epoch, args.epochs):
@@ -228,17 +359,34 @@ def main():
         t_closs = tf.keras.metrics.Mean()
 
         tq = tqdm(train_batch, desc=f"Epoch {epoch + 1}/{args.epochs}")
-        for batch_idx, (eeg_batch, _, image_batch) in enumerate(tq, start=1):
+        for batch_idx, (eeg_batch, label_batch, image_batch) in enumerate(tq, start=1):
             if args.max_steps_per_epoch and batch_idx > args.max_steps_per_epoch:
                 break
-            _, cond_features = triplenet(eeg_batch, training=False)
+            cond_embedding, cond_features = triplenet(eeg_batch, training=False)
+            cond_vector_base = select_condition_vector(
+                cond_embedding,
+                cond_features,
+                condition_source=args.condition_source,
+                condition_scale=args.condition_scale,
+            )
+            cond_vector = compose_condition_vector(
+                cond_vector_base,
+                label_batch,
+                n_classes=n_classes,
+                condition_strategy=args.condition_strategy,
+                class_prototypes=class_prototypes,
+                prototype_alpha=args.prototype_alpha,
+                post_mix_l2norm=args.post_mix_l2norm,
+                use_label_condition=args.use_label_condition,
+            )
             gloss, closs = dist_train_step(
                 strategy,
                 model,
                 model_gopt,
                 model_copt,
                 image_batch,
-                cond_features,
+                cond_vector,
+                label_batch,
                 latent_dim=args.latent_dim,
                 batch_size=int(image_batch.shape[0]),
                 use_diffaug=args.use_diffaug,
@@ -266,9 +414,19 @@ def main():
             "step": int(ckpt.step.numpy()),
             "generator_loss": float(t_gloss.result().numpy()),
             "discriminator_loss": float(t_closs.result().numpy()),
+            "encoder_variant": args.encoder_variant,
+            "condition_source": args.condition_source,
+            "condition_strategy": args.condition_strategy,
+            "condition_scale": args.condition_scale,
+            "prototype_alpha": args.prototype_alpha,
+            "post_mix_l2norm": args.post_mix_l2norm,
+            "use_label_condition": args.use_label_condition,
             "use_diffaug": args.use_diffaug,
             "use_mode_loss": args.use_mode_loss,
             "mode_loss_weight": args.mode_loss_weight,
+            "gen_label_mode": args.gen_label_mode,
+            "disc_condition_mode": args.disc_condition_mode,
+            "disc_label_mode": args.disc_label_mode,
         }
         append_jsonl(log_path, log_payload)
         print(log_payload)

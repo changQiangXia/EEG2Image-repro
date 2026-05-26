@@ -9,13 +9,19 @@ tf.random.set_seed(45)
 # np.random.seed(45)
 
 class Generator(Model):
-	def __init__(self, n_class=10, res=128):
+	def __init__(self, n_class=10, res=128, input_dim=256, label_mode="none"):
 		super(Generator, self).__init__()
 		# filters   = [  1024, 512, 256, 128,  64, 32]#, 32, 16]
 		# strides   = [     4,   2,   2,   2,   2,  2]#,  2, 2]
 		filters   = [  1024, 512, 256, 128,  64, 32]#, 16]
 		strides   = [     4,   2,   2,   2,   2,  2]#, 2]
 		self.cnn_depth  = len(filters)
+		self.label_mode = label_mode
+		self.label_bias = layers.Embedding(
+			input_dim=n_class,
+			output_dim=input_dim,
+			embeddings_initializer="zeros",
+		)
 
 		# For discrete condition we are using Embedding
 		self.cond_embedding = layers.Embedding(input_dim=n_class, output_dim=50)
@@ -44,9 +50,13 @@ class Generator(Model):
 									   use_bias=False))
 
 	@tf.function
-	def call(self, X):
+	def call(self, X, labels=None):
 		# C = self.cond_reshape( self.cond_dense( self.cond_flat( self.cond_embedding( C ) ) ) )
 		# X = tf.concat([C, X], axis=-1)
+		if self.label_mode == "latent_bias":
+			if labels is None:
+				raise ValueError("labels is required when generator label_mode=latent_bias")
+			X = X + self.label_bias(tf.cast(labels, tf.int32))
 		
 		X = tf.expand_dims(tf.expand_dims(X, axis=1), axis=1)
 		X = self.act[0]( self.conv[0]( X ) )
@@ -60,7 +70,7 @@ class Generator(Model):
 
 
 class Discriminator(Model):
-	def __init__(self, n_class=10, res=128):
+	def __init__(self, n_class=10, res=128, condition_mode="concat", label_mode="none"):
 		super(Discriminator, self).__init__()
 		# filters    = [32, 64, 128, 256, 256, 512, 512, 1]
 		# strides    = [ 2,  2,   2,   2,   2,   2,   1, 1]
@@ -69,6 +79,8 @@ class Discriminator(Model):
 		filters    = [ 64, 128, 256, 512, 1024, 1]
 		strides    = [  2,   2,   2,   2,    1, 1]
 		self.cnn_depth = len(filters)
+		self.condition_mode = condition_mode
+		self.label_mode = label_mode
 
 		# For discrete condition we are using Embedding
 		self.cond_embedding = layers.Embedding(input_dim=n_class, output_dim=50)
@@ -91,21 +103,42 @@ class Discriminator(Model):
 		self.flat      = layers.Flatten()
 
 		self.disc_out  = layers.Dense(units=1)
+		self.proj_pool = layers.GlobalAveragePooling2D()
+		self.proj_dense = SpectralNormalization(
+			layers.Dense(
+				units=filters[-2],
+				use_bias=False,
+				kernel_initializer=tf.keras.initializers.TruncatedNormal(mean=0.0, stddev=0.02),
+			)
+		)
+		self.label_proj = layers.Embedding(
+			input_dim=n_class,
+			output_dim=filters[-2],
+			embeddings_initializer="zeros",
+		)
 
 		# self.autoenc   = Autoencoder()
 
 	@tf.function
-	def call(self, x, C):
+	def call(self, x, C, labels=None):
 		#x         = self.cnn_merge( x )
 		#x         = self.cnn_exp( x )
 		# mem_bank   = []
 		# C = self.cond_reshape( self.cond_dense( self.cond_flat( self.cond_embedding( C ) ) ) )
+		condition = C
 		C = tf.expand_dims( tf.expand_dims(C, axis=1), axis=1)
 		C = tf.tile(C, [1, x.shape[1], x.shape[2], 1])
 		x = tf.concat([x, C], axis=-1)
 
+		proj_feature_map = None
+
 		for layer_no in range(self.cnn_depth):
 			# print(x.shape)
+			if (
+				(self.condition_mode == "concat_proj" or self.label_mode == "projection")
+				and layer_no == self.cnn_depth - 1
+			):
+				proj_feature_map = x
 			x = self.cnn_act[layer_no]( self.cnn_bnorm[layer_no]( self.cnn_conv[layer_no]( x ) ) )
 			# x = self.cnn_bnorm[layer_no]( self.cnn_act[layer_no]( self.cnn_conv[layer_no]( x ) ) )
 			# x = self.cnn_act[layer_no]( self.cnn_conv[layer_no]( x ) )
@@ -134,14 +167,41 @@ class Discriminator(Model):
 		# x = self.final_act( x )
 		# x = self.out( self.flat( x ) )
 		x = self.disc_out( self.flat( x ) )
+		if self.condition_mode == "concat_proj":
+			if proj_feature_map is None:
+				raise ValueError("Projection feature map was not captured")
+			pooled_feature = self.proj_pool(proj_feature_map)
+			projected_condition = self.proj_dense(condition)
+			projection_score = tf.reduce_sum(pooled_feature * projected_condition, axis=-1, keepdims=True)
+			x = x + projection_score
+		if self.label_mode == "projection":
+			if proj_feature_map is None:
+				raise ValueError("Projection feature map was not captured")
+			if labels is None:
+				raise ValueError("labels is required when discriminator label_mode=projection")
+			pooled_feature = self.proj_pool(proj_feature_map)
+			projected_label = self.label_proj(tf.cast(labels, tf.int32))
+			label_score = tf.reduce_sum(pooled_feature * projected_label, axis=-1, keepdims=True)
+			x = x + label_score
 
 		return x, reconst_x
 
 class DCGAN(Model):
-	def __init__(self):
+	def __init__(
+		self,
+		n_classes=10,
+		gen_input_dim=256,
+		gen_label_mode="none",
+		disc_condition_mode="concat",
+		disc_label_mode="none",
+	):
 		super(DCGAN, self).__init__()
-		self.gen    = Generator()
-		self.disc   = Discriminator()
+		self.gen    = Generator(n_class=n_classes, input_dim=gen_input_dim, label_mode=gen_label_mode)
+		self.disc   = Discriminator(
+			n_class=n_classes,
+			condition_mode=disc_condition_mode,
+			label_mode=disc_label_mode,
+		)
 
 @tf.function
 def dist_train_step(
@@ -151,6 +211,7 @@ def dist_train_step(
 	model_copt,
 	X,
 	C,
+	Y,
 	latent_dim=96,
 	batch_size=64,
 	use_diffaug=True,
@@ -169,19 +230,19 @@ def dist_train_step(
 			return images
 		return diff_augment(images, policy=diff_augment_policies)
 	# @tf.function
-	def train_step_disc(model, model_gopt, model_copt, X, C, latent_dim=96, batch_size=64):	
+	def train_step_disc(model, model_gopt, model_copt, X, C, Y, latent_dim=96, batch_size=64):
 		with tf.GradientTape() as ctape:
 			# noise_vector = tf.random.uniform(shape=(batch_size, latent_dim), minval=-1, maxval=1)
 			# noise_vector = tf.random.uniform(shape=(batch_size, latent_dim), minval=-1, maxval=1)
 			# noise_vector = tf.random.normal(shape=(batch_size, latent_dim))
 
-			fake_img     = model.gen(noise_vector, training=False)
+			fake_img     = model.gen(noise_vector, labels=Y, training=False)
 
 			X_aug        = maybe_augment(X)
 			fake_img     = maybe_augment(fake_img)
 
-			D_real, X_recon = model.disc(X_aug, C, training=True)
-			D_fake, _       = model.disc(fake_img, C, training=True)
+			D_real, X_recon = model.disc(X_aug, C, labels=Y, training=True)
+			D_fake, _       = model.disc(fake_img, C, labels=Y, training=True)
 
 			# c_loss       = disc_loss(D_real, D_fake) +\
 			# 			   tf.reduce_mean(tf.keras.losses.MeanAbsoluteError(reduction=tf.keras.losses.Reduction.NONE)(X_aug, X_recon))
@@ -195,21 +256,21 @@ def dist_train_step(
 		return c_loss
 
 	# @tf.function
-	def train_step_gen(model, model_gopt, model_copt, X, C, latent_dim=96, batch_size=64):
+	def train_step_gen(model, model_gopt, model_copt, X, C, Y, latent_dim=96, batch_size=64):
 		with tf.GradientTape() as gtape:
 			# noise_vector = tf.random.uniform(shape=(batch_size, latent_dim), minval=-1, maxval=1)
 			# noise_vector = tf.random.normal(shape=(batch_size, latent_dim))
 			
-			fake_img_o   = model.gen(noise_vector, training=True)
+			fake_img_o   = model.gen(noise_vector, labels=Y, training=True)
 			fake_img     = maybe_augment(fake_img_o)
 
-			D_fake, _    = model.disc(fake_img, C, training=False)
+			D_fake, _    = model.disc(fake_img, C, labels=Y, training=False)
 			g_loss       = gen_hinge(D_fake)
 
 			if use_mode_loss:
-				fake_img_2_o = model.gen(noise_vector_2, training=True)
+				fake_img_2_o = model.gen(noise_vector_2, labels=Y, training=True)
 				fake_img_2   = maybe_augment(fake_img_2_o)
-				D_fake_2, _  = model.disc(fake_img_2, C, training=False)
+				D_fake_2, _  = model.disc(fake_img_2, C, labels=Y, training=False)
 				g_loss      += gen_hinge(D_fake_2)
 				mode_loss    = tf.divide(
 					tf.reduce_mean(tf.abs(tf.subtract(fake_img_2_o, fake_img_o))),
@@ -223,8 +284,8 @@ def dist_train_step(
 		model_gopt.apply_gradients(zip(gradients, variables))
 		return g_loss
 
-	per_replica_loss_disc = mirrored_strategy.run(train_step_disc, args=(model, model_gopt, model_copt, X, C, latent_dim, batch_size,))
-	per_replica_loss_gen  = mirrored_strategy.run(train_step_gen, args=(model, model_gopt, model_copt, X, C, latent_dim, batch_size,))
+	per_replica_loss_disc = mirrored_strategy.run(train_step_disc, args=(model, model_gopt, model_copt, X, C, Y, latent_dim, batch_size,))
+	per_replica_loss_gen  = mirrored_strategy.run(train_step_gen, args=(model, model_gopt, model_copt, X, C, Y, latent_dim, batch_size,))
 	
 	# print(per_replica_loss_disc)
 
